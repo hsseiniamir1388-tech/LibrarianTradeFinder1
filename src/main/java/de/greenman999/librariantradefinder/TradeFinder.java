@@ -64,6 +64,12 @@ public class TradeFinder {
     private static int offersRetries = 0;
     private static int actionFailures = 0;
     private static int breakSlot = -1;
+    private static int aimStable = 0;            // consecutive ticks the crosshair has been on the target
+    private static int breakConfirm = -1;        // -1 = not waiting; else ticks left to confirm the server broke it
+    private static int breakRejects = 0;
+    private static boolean verifyPlacement = false;
+    private static int placeVerify = 0;
+    private static int placeRejects = 0;
 
     public static void stop() {
         state = TradeState.IDLE;
@@ -79,10 +85,47 @@ public class TradeFinder {
         offersRetries = 0;
         actionFailures = 0;
         breakSlot = -1;
+        resetConfirmations();
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.gui != null) {
             mc.gui.setOverlayMessage(Component.literal(""), false);
+        }
+    }
+
+    private static void resetConfirmations() {
+        aimStable = 0;
+        breakConfirm = -1;
+        breakRejects = 0;
+        verifyPlacement = false;
+        placeVerify = 0;
+        placeRejects = 0;
+    }
+
+    /** About 2x the ping in ticks (min 3): enough time for the server to answer our action. */
+    private static int confirmTicks(Minecraft mc, LocalPlayer player) {
+        int ms = 0;
+        if (mc.getConnection() != null) {
+            var info = mc.getConnection().getPlayerInfo(player.getUUID());
+            if (info != null) ms = info.getLatency();
+        }
+        return Math.min(20, Math.max(3, ms / 25 + 2));
+    }
+
+    /** Needs the crosshair on target for 2 ticks in a row, so the server has our rotation before we act. */
+    private static boolean aimSettled(boolean onTarget) {
+        if (!onTarget) {
+            aimStable = 0;
+            return false;
+        }
+        aimStable++;
+        return aimStable >= 2;
+    }
+
+    private static void warn(String message) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player != null) {
+            HudUtils.chatMessage(HudUtils.text(message, ChatFormatting.YELLOW));
         }
     }
 
@@ -106,6 +149,7 @@ public class TradeFinder {
         offersRetries = 0;
         actionFailures = 0;
         lastState = TradeState.IDLE;
+        resetConfirmations();
         breakSlot = mc.player != null ? mc.player.getInventory().getSelectedSlot() : -1;
         state = TradeState.CHECK;
     }
@@ -263,6 +307,8 @@ public class TradeFinder {
             }
         } else {
             tries++;
+            breakConfirm = -1;
+            breakRejects = 0;
             state = TradeState.BREAK;
             cooldown = 1 + slowExtra();
         }
@@ -299,6 +345,7 @@ public class TradeFinder {
             lastState = state;
             stateTicks = 0;
             actionFailures = 0;
+            aimStable = 0;
         }
         stateTicks++;
 
@@ -329,6 +376,26 @@ public class TradeFinder {
     }
 
     private static void tickCheck(Minecraft mc, LocalPlayer player) {
+        // Did the server really accept the lectern we just placed?
+        if (verifyPlacement) {
+            if (placeVerify > 0) {
+                placeVerify--;
+                return;
+            }
+            verifyPlacement = false;
+            if (!(mc.level.getBlockState(lecternPos).getBlock() instanceof LecternBlock)) {
+                if (++placeRejects > 5) {
+                    fail("The server keeps rejecting the lectern placement.");
+                    return;
+                }
+                warn("Server rejected the lectern placement, retrying (" + placeRejects + "/5)");
+                state = TradeState.PLACE;
+                cooldown = 5;
+                return;
+            }
+            placeRejects = 0;
+        }
+
         // After the lectern is back, the villager needs a moment to take the job again.
         if (!villager.getVillagerData().profession().is(VillagerProfession.LIBRARIAN)) {
             if (stateTicks > JOB_TIMEOUT) {
@@ -338,12 +405,15 @@ public class TradeFinder {
         }
 
         // Aim at the villager. Only click when the crosshair is REALLY on that villager.
-        if (!(mc.hitResult instanceof EntityHitResult entityHit) || entityHit.getEntity().getId() != villager.getId()) {
-            if (stateTicks > AIM_TIMEOUT) {
-                fail("Can't aim at the villager (too far or something is in the way).");
-                return;
+        EntityHitResult entityHit = (mc.hitResult instanceof EntityHitResult e && e.getEntity().getId() == villager.getId()) ? e : null;
+        if (!aimSettled(entityHit != null)) {
+            if (entityHit == null) {
+                if (stateTicks > AIM_TIMEOUT) {
+                    fail("Can't aim at the villager (too far or something is in the way).");
+                    return;
+                }
+                RotationTools.stepTowards(player, villager.getBoundingBox().getCenter());
             }
-            RotationTools.stepTowards(player, villager.getBoundingBox().getCenter());
             return;
         }
 
@@ -373,18 +443,41 @@ public class TradeFinder {
     private static void tickBreak(Minecraft mc, LocalPlayer player) {
         Inventory inventory = player.getInventory();
 
-        // Back to the tool slot (we switch to the lectern slot while placing)
+        // Back to the tool slot (only matters if we had to switch slots for placing)
         if (breakSlot >= 0 && inventory.getSelectedSlot() != breakSlot) {
             inventory.setSelectedSlot(breakSlot);
             cooldown = 2;
             return;
         }
 
-        // Lectern gone -> next step
-        if (!(mc.level.getBlockState(lecternPos).getBlock() instanceof LecternBlock)) {
-            mc.gameMode.stopDestroyBlock();
+        boolean lecternThere = mc.level.getBlockState(lecternPos).getBlock() instanceof LecternBlock;
+
+        if (!lecternThere) {
+            // The client thinks it is broken. Give the server time to confirm before we move on:
+            // if the server rejects the break, the lectern pops back and we see it again.
+            if (breakConfirm < 0) breakConfirm = confirmTicks(mc, player);
+            if (breakConfirm > 0) {
+                breakConfirm--;
+                return;
+            }
+            breakConfirm = -1;
+            breakRejects = 0;
             state = TradeState.PLACE;
-            cooldown = 3 + slowExtra();
+            cooldown = 1 + slowExtra();
+            return;
+        }
+
+        if (breakConfirm >= 0) {
+            // Lectern is back => the server did NOT accept the break.
+            breakConfirm = -1;
+            mc.gameMode.stopDestroyBlock();
+            if (++breakRejects > 5) {
+                fail("The server keeps rejecting breaking the lectern (protected area, wrong tool, or its anti-cheat).");
+                return;
+            }
+            warn("Server rejected breaking the lectern, retrying (" + breakRejects + "/5)");
+            aimStable = 0;
+            cooldown = 10;
             return;
         }
 
@@ -403,8 +496,11 @@ public class TradeFinder {
         }
 
         // Only dig while the crosshair is really on the lectern
-        if (!(mc.hitResult instanceof BlockHitResult blockHit) || !blockHit.getBlockPos().equals(lecternPos)) {
-            RotationTools.stepTowards(player, lecternPos.getCenter());
+        BlockHitResult blockHit = (mc.hitResult instanceof BlockHitResult b && b.getBlockPos().equals(lecternPos)) ? b : null;
+        if (!aimSettled(blockHit != null)) {
+            if (blockHit == null) {
+                RotationTools.stepTowards(player, lecternPos.getCenter());
+            }
             return;
         }
 
@@ -451,20 +547,25 @@ public class TradeFinder {
 
         // Aim at the top face of the block below the lectern spot
         Vec3 aim = new Vec3(below.getX() + 0.5, below.getY() + 0.98, below.getZ() + 0.5);
-        if (!(mc.hitResult instanceof BlockHitResult blockHit)
-                || !blockHit.getBlockPos().equals(below)
-                || blockHit.getDirection() != Direction.UP) {
-            if (stateTicks > AIM_TIMEOUT) {
-                fail("Can't aim at the top of the block under the lectern spot.");
-                return;
+        BlockHitResult blockHit = (mc.hitResult instanceof BlockHitResult b
+                && b.getBlockPos().equals(below)
+                && b.getDirection() == Direction.UP) ? b : null;
+        if (!aimSettled(blockHit != null)) {
+            if (blockHit == null) {
+                if (stateTicks > AIM_TIMEOUT) {
+                    fail("Can't aim at the top of the block under the lectern spot.");
+                    return;
+                }
+                RotationTools.stepTowards(player, aim);
             }
-            RotationTools.stepTowards(player, aim);
             return;
         }
 
         InteractionResult result = mc.gameMode.useItemOn(player, placeHand, blockHit);
         if (result.consumesAction()) {
             player.swing(placeHand);
+            verifyPlacement = true;
+            placeVerify = confirmTicks(mc, player);
             state = TradeState.CHECK;
             cooldown = 2 + slowExtra();
         } else if (++actionFailures > 5) {
