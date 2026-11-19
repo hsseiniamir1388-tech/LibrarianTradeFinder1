@@ -70,6 +70,7 @@ public class TradeFinder {
     private static boolean verifyPlacement = false;
     private static int placeVerify = 0;
     private static int placeRejects = 0;
+    private static int pendingUse = 0;           // 1 = villager click in progress, 2 = lectern placement in progress
 
     public static void stop() {
         state = TradeState.IDLE;
@@ -86,11 +87,22 @@ public class TradeFinder {
         actionFailures = 0;
         breakSlot = -1;
         resetConfirmations();
+        releaseKeys();
 
         Minecraft mc = Minecraft.getInstance();
         if (mc.gui != null) {
             mc.gui.setOverlayMessage(Component.literal(""), false);
         }
+    }
+
+    /** Let go of the real mouse buttons the mod is pressing for the player. */
+    private static void releaseKeys() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.options != null) {
+            mc.options.keyAttack.setDown(false);
+            mc.options.keyUse.setDown(false);
+        }
+        pendingUse = 0;
     }
 
     private static void resetConfirmations() {
@@ -357,8 +369,25 @@ public class TradeFinder {
             }
         }
 
+        // Finish a mouse click we started on the previous tick (the game itself performs the click)
+        if (pendingUse != 0) {
+            mc.options.keyUse.setDown(false);
+            int what = pendingUse;
+            pendingUse = 0;
+            if (what == 2) {
+                verifyPlacement = true;
+                placeVerify = confirmTicks(mc, player);
+                state = TradeState.CHECK;
+                cooldown = 2 + slowExtra();
+            }
+            return;
+        }
+
         // Like a real player: don't act while some GUI is open
-        if (mc.screen != null) return;
+        if (mc.screen != null) {
+            releaseKeys();
+            return;
+        }
 
         if (cooldown > 0) {
             cooldown--;
@@ -417,16 +446,11 @@ public class TradeFinder {
             return;
         }
 
-        InteractionResult result = mc.gameMode.interact(player, villager, entityHit, InteractionHand.MAIN_HAND);
-        if (result.consumesAction()) {
-            player.swing(InteractionHand.MAIN_HAND);
-            offersRetries = 0;
-            state = TradeState.WAITING_FOR_PACKET;   // one click, then wait. No more clicks until the offers arrive.
-        } else if (++actionFailures > 5) {
-            fail("The villager does not react to clicks.");
-        } else {
-            cooldown = 2;
-        }
+        // Real right-click: the game itself sends the interaction, exactly like a human click.
+        mc.options.keyUse.setDown(true);
+        pendingUse = 1;
+        offersRetries = 0;
+        state = TradeState.WAITING_FOR_PACKET;   // one click, then wait. No more clicks until the offers arrive.
     }
 
     private static void tickWaiting() {
@@ -453,6 +477,7 @@ public class TradeFinder {
         boolean lecternThere = mc.level.getBlockState(lecternPos).getBlock() instanceof LecternBlock;
 
         if (!lecternThere) {
+            mc.options.keyAttack.setDown(false);
             // The client thinks it is broken. Give the server time to confirm before we move on:
             // if the server rejects the break, the lectern pops back and we see it again.
             if (breakConfirm < 0) breakConfirm = confirmTicks(mc, player);
@@ -470,6 +495,7 @@ public class TradeFinder {
         if (breakConfirm >= 0) {
             // Lectern is back => the server did NOT accept the break.
             breakConfirm = -1;
+            mc.options.keyAttack.setDown(false);
             mc.gameMode.stopDestroyBlock();
             if (++breakRejects > 5) {
                 fail("The server keeps rejecting breaking the lectern (protected area, wrong tool, or its anti-cheat).");
@@ -498,15 +524,15 @@ public class TradeFinder {
         // Only dig while the crosshair is really on the lectern
         BlockHitResult blockHit = (mc.hitResult instanceof BlockHitResult b && b.getBlockPos().equals(lecternPos)) ? b : null;
         if (!aimSettled(blockHit != null)) {
+            mc.options.keyAttack.setDown(false);
             if (blockHit == null) {
                 RotationTools.stepTowards(player, lecternPos.getCenter());
             }
             return;
         }
 
-        if (mc.gameMode.continueDestroyBlock(lecternPos, blockHit.getDirection())) {
-            player.swing(InteractionHand.MAIN_HAND);
-        }
+        // Hold the real attack button on the lectern, exactly like a human does. The game does the digging.
+        mc.options.keyAttack.setDown(true);
     }
 
     private static void tickPlace(Minecraft mc, LocalPlayer player) {
@@ -515,12 +541,8 @@ public class TradeFinder {
 
         // Lectern goes in the OFF hand (axe stays in the main hand). If it is not there,
         // fall back to a lectern that is already in the main hand, or one in the hotbar.
-        InteractionHand placeHand;
-        if (player.getOffhandItem().getItem() == Items.LECTERN) {
-            placeHand = InteractionHand.OFF_HAND;
-        } else if (inventory.getSelectedItem().getItem() == Items.LECTERN) {
-            placeHand = InteractionHand.MAIN_HAND;
-        } else {
+        if (player.getOffhandItem().getItem() != Items.LECTERN
+                && inventory.getSelectedItem().getItem() != Items.LECTERN) {
             int slot = -1;
             for (int i = 0; i < 9; i++) {
                 if (inventory.getItem(i).getItem() == Items.LECTERN) {
@@ -561,17 +583,9 @@ public class TradeFinder {
             return;
         }
 
-        InteractionResult result = mc.gameMode.useItemOn(player, placeHand, blockHit);
-        if (result.consumesAction()) {
-            player.swing(placeHand);
-            verifyPlacement = true;
-            placeVerify = confirmTicks(mc, player);
-            state = TradeState.CHECK;
-            cooldown = 2 + slowExtra();
-        } else if (++actionFailures > 5) {
-            fail("Placing the lectern failed.");
-        } else {
-            cooldown = 2;
-        }
+        // Real right-click on the top of the block below. The game tries the main hand first
+        // (axe does nothing on that block) and then places the lectern from the off hand.
+        mc.options.keyUse.setDown(true);
+        pendingUse = 2;
     }
 }
