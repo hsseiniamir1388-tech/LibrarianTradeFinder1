@@ -417,8 +417,14 @@ public class TradeFinder {
         Inventory inventory = player.getInventory();
         BlockPos below = lecternPos.below();
 
-        // Lectern in the main hand (hotbar slot switch, like pressing a number key)
-        if (inventory.getSelectedItem().getItem() != Items.LECTERN) {
+        // Lectern goes in the OFF hand (axe stays in the main hand). If it is not there,
+        // fall back to a lectern that is already in the main hand, or one in the hotbar.
+        InteractionHand placeHand;
+        if (player.getOffhandItem().getItem() == Items.LECTERN) {
+            placeHand = InteractionHand.OFF_HAND;
+        } else if (inventory.getSelectedItem().getItem() == Items.LECTERN) {
+            placeHand = InteractionHand.MAIN_HAND;
+        } else {
             int slot = -1;
             for (int i = 0; i < 9; i++) {
                 if (inventory.getItem(i).getItem() == Items.LECTERN) {
@@ -427,7 +433,7 @@ public class TradeFinder {
                 }
             }
             if (slot == -1) {
-                fail("No lectern in your hotbar. Put lecterns in the hotbar and start again.");
+                fail("No lectern in your off hand. Put lecterns in your off hand (axe in main hand) and start again.");
                 return;
             }
             inventory.setSelectedSlot(slot);
@@ -456,9 +462,9 @@ public class TradeFinder {
             return;
         }
 
-        InteractionResult result = mc.gameMode.useItemOn(player, InteractionHand.MAIN_HAND, blockHit);
+        InteractionResult result = mc.gameMode.useItemOn(player, placeHand, blockHit);
         if (result.consumesAction()) {
-            player.swing(InteractionHand.MAIN_HAND);
+            player.swing(placeHand);
             state = TradeState.CHECK;
             cooldown = 2 + slowExtra();
         } else if (++actionFailures > 5) {
